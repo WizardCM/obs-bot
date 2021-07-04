@@ -1,8 +1,11 @@
 import logging
+import json
 
 from discord import Message, Embed, Member
 from discord.ext.commands import Cog, command, Context
 from discord_slash import SlashContext
+from discord_slash.utils.manage_components import create_button, create_actionrow
+from discord_slash.model import ButtonStyle
 
 from .utils.ratelimit import RateLimiter
 
@@ -61,7 +64,7 @@ class Factoids(Cog):
         for record in rows:
             name = record['name']
             factoid = dict(name=name, uses=record['uses'], embed=record['embed'], message=record['message'],
-                           image_url=record['image_url'], aliases=record['aliases'])
+                           image_url=record['image_url'], aliases=record['aliases'], buttons=record['buttons'])
             self.factoids[name] = factoid
             for alias in record['aliases']:
                 self.alias_map[alias] = name
@@ -171,12 +174,25 @@ class Factoids(Cog):
             if factoid['image_url']:
                 embed.set_image(url=factoid['image_url'])
 
+        buttons = None
+        if factoid['buttons'] and factoid['buttons'] != '{}':
+            try:
+                buttonsJson = json.loads(factoid['buttons'])
+                buttons = []
+                for i in buttonsJson:
+                    buttons.append(create_button(style=ButtonStyle.URL, url=i['url'], label=i['text']))
+                buttons = [create_actionrow(*buttons)]
+            except Exception as e:
+                logger.warn(f'Failed to parse button JSON for {factoid_name}. Ignoring.')
+                buttons = None
+
         if user_mention and embed is not None:
-            return await msg.channel.send(user_mention, embed=embed)
+            return await msg.channel.send(user_mention, embed=embed, components=buttons)
         elif user_mention:
-            return await msg.channel.send(f'{user_mention} {message}')
+            return await msg.channel.send(f'{user_mention} {message}', components=buttons)
         else:
-            return await msg.channel.send(message, embed=embed, reference=msg.reference, mention_author=True)
+            return await msg.channel.send(message, embed=embed, reference=msg.reference,
+                                          mention_author=True, components=buttons)
 
     async def increment_uses(self, factoid_name):
         return await self.bot.db.add_task(
@@ -348,6 +364,52 @@ class Factoids(Cog):
         return await ctx.send(f'Image URL for "{name}" set to {url}')
 
     @command()
+    async def setbuttons(self, ctx: Context, name: str.lower, *, buttonsRaw: str):
+        # action: str.lower,
+        if not self.bot.is_admin(ctx.author):
+            return
+
+        # actions = ['add', 'remove', 'modify']
+        # if not action in actions:
+        #     actionsStr = ', '.join(actions)
+        #     return await ctx.send(f'The specified action "{action}" is not recognised. Only "{actionsStr}"')
+
+        _name = name if name in self.factoids else self.alias_map.get(name)
+        if not _name or _name not in self.factoids:
+            return await ctx.send(f'The specified factoid ("{name}") does not exist!')
+
+        buttonsExample = []
+        buttonsJson = []
+        try:
+            buttonsJson = json.loads(buttonsRaw)
+            if not len(buttonsJson) > 0:
+                return await ctx.send('Buttons array is empty. At least one button needs to be defined.')
+            for i in buttonsJson:
+                if 'text' in i and 'url' in i and type(i['url']) == str and (i['url'].startswith('http://') or i['url'].startswith('https://')):
+                    try:
+                        buttonsExample.append(create_button(style=ButtonStyle.URL, url=i['url'], label=i['text']))
+                    except Exception as e:
+                        logger.warning(f'Validating button failed with "{repr(e)}"')
+
+        except json.JSONDecodeError:
+            return await ctx.send('Buttons JSON is invalid.')
+
+        if len(buttonsExample) < len(buttonsJson) or not len(buttonsExample) > 0:
+            return await ctx.send("Some buttons couldn't be created. Verify that your JSON follows the correct structure.")
+
+        try:
+            await self.bot.db.exec(
+                f'''UPDATE "{self.config["db_table"]}" SET buttons=$2 WHERE name=$1''',
+                _name, buttonsRaw
+            )
+            return await ctx.send('All buttons added successfully. Example below.',
+                                  components=[create_actionrow(*buttonsExample)])
+        except Exception as e:
+            logger.error(f'Failed creating buttons for {_name}: {repr(e)}')
+            return await ctx.send(f'Failed to create buttons. Please double check your JSON.')
+
+
+    @command()
     async def info(self, ctx: Context, name: str.lower):
         _name = name if name in self.factoids else self.alias_map.get(name)
         if not _name or _name not in self.factoids:
@@ -359,6 +421,9 @@ class Factoids(Cog):
                       description=f'```{message}```')
         if factoid['aliases']:
             embed.add_field(name='Aliases', value=', '.join(factoid['aliases']))
+        if factoid['buttons']:
+            buttons = factoid['buttons']
+            embed.add_field(name='Buttons', value=f'```{buttons}```', inline=False)
         embed.add_field(name='Uses (since 2018-06-07)', value=str(factoid['uses']))
         embed.add_field(name='Is Embed', value=str(factoid['embed']))
         if factoid['image_url']:

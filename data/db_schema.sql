@@ -5,6 +5,7 @@ CREATE TABLE "factoids"
     aliases text[] DEFAULT '{}',
     "message" text NOT NULL,
     image_url text,
+    buttons json,
     embed BOOL DEFAULT true,
     uses integer DEFAULT 0
 );
